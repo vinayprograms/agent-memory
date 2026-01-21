@@ -123,6 +123,60 @@ curl http://localhost:8080/health
 ./tests/qa/sessions.sh
 ```
 
+### Claude Code Integration
+
+The memory service stores messages, but they must be actively pushed from Claude Code. Configure hooks to automatically ship conversation data:
+
+Copy the `../memory-push.sh` hook script to your Claude hooks directory and configure your `~/.claude.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/memory-push.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/memory-push.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/memory-push.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**Hook Events:**
+| Event | When Triggered |
+|-------|----------------|
+| `UserPromptSubmit` | User sends a message |
+| `Stop` | Claude finishes responding |
+| `PostToolUse` | After any tool is executed |
+
 ## ONNX Model Setup
 
 The service uses ONNX Runtime for generating text embeddings. Without a model, it falls back to stub embeddings (random vectors) which won't provide meaningful semantic search.
