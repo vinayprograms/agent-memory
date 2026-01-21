@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+#
+# mem - CLI for memory-service
+#
+# Usage:
+#   mem query "search text" [--level LEVEL] [--top LEVEL] [--bottom LEVEL] [--max N]
+#   mem drill ID [--filter TEXT] [--max N]
+#   mem zoom ID
+#   mem sessions [SESSION_ID]
+#   mem store message SESSION_ID AGENT_ID "content"
+#   mem store block PARENT_ID "content"
+#   mem store statement PARENT_ID "content"
+#
+# Environment:
+#   MEMORY_SERVICE_HOST  Service endpoint (default: localhost:8080)
+#
+
+set -euo pipefail
+
+HOST="${MEMORY_SERVICE_HOST:-localhost:8080}"
+ENDPOINT="http://${HOST}/rpc"
+
+# Colors (disabled if not a terminal)
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+    CYAN='\033[0;36m'
+    DIM='\033[0;90m'
+    BOLD='\033[1m'
+    RESET='\033[0m'
+else
+    RED='' GREEN='' YELLOW='' BLUE='' CYAN='' DIM='' BOLD='' RESET=''
+fi
+
+usage() {
+    cat <<EOF
+${BOLD}mem${RESET} - CLI for memory-service
+
+${BOLD}USAGE${RESET}
+    mem <command> [options]
+
+${BOLD}COMMANDS${RESET}
+    ${GREEN}query${RESET} TEXT [options]     Semantic search
+        --level LEVEL           Search single level (session|message|block|statement)
+        --top LEVEL             Highest level to search (default: session)
+        --bottom LEVEL          Lowest level to search (default: statement)
+        --max N                 Max results (default: 10)
+
+    ${GREEN}drill${RESET} ID [options]       Get children of a node
+        --filter TEXT           Filter children by text
+        --max N                 Max results (default: 100)
+
+    ${GREEN}zoom${RESET} ID                  Get ancestors of a node
+
+    ${GREEN}sessions${RESET} [ID]            List sessions or get specific session
+
+    ${GREEN}store${RESET} TYPE ...           Store content
+        store message SESSION AGENT "content"
+        store block PARENT_ID "content"
+        store statement PARENT_ID "content"
+
+    ${GREEN}health${RESET}                   Check service health
+
+${BOLD}EXAMPLES${RESET}
+    mem query "authentication token"
+    mem query "API methods" --level block --max 5
+    mem drill 3 --filter "token"
+    mem zoom 15
+    mem sessions
+    mem store message my-session claude "Working on feature X"
+
+${BOLD}ENVIRONMENT${RESET}
+    MEMORY_SERVICE_HOST     Service endpoint (default: localhost:8080)
+EOF
+    exit 0
+}
+
+error() {
+    echo -e "${RED}error:${RESET} $1" >&2
+    exit 1
+}
+
+# Make JSON-RPC call
+rpc() {
+    local method="$1"
+    local params="$2"
+
+    local payload=$(cat <<EOF
+{"jsonrpc": "2.0", "method": "${method}", "params": ${params}, "id": 1}
+EOF
+)
+
+    local response
+    response=$(curl -s -X POST "$ENDPOINT" \
+        -H "Content-Type: application/json" \
+        -d "$payload" 2>/dev/null) || error "Failed to connect to ${HOST}"
+
+    # Check for JSON-RPC error
+    local err=$(echo "$response" | jq -r '.error.message // empty')
+    if [[ -n "$err" ]]; then
+        error "$err"
+    fi
+
+    echo "$response" | jq -r '.result'
+}
+
+# Format score as colored bar
+format_score() {
+    local score=$1
+    local pct=$(echo "$score * 100" | bc | cut -d. -f1)
+    local bar=""
+    local filled=$((pct / 5))
+
+    for ((i=0; i<filled && i<20; i++)); do
+        bar+="█"
+    done
+    for ((i=filled; i<20; i++)); do
+        bar+="░"
+    done
+
+    if (( pct >= 60 )); then
+        echo -e "${GREEN}${bar}${RESET} ${pct}%"
+    elif (( pct >= 40 )); then
+        echo -e "${YELLOW}${bar}${RESET} ${pct}%"
+    else
+        echo -e "${DIM}${bar}${RESET} ${pct}%"
+    fi
+}
+
+# Format level with color
+format_level() {
+    local level=$1
+    case "$level" in
+        session)   echo -e "${BLUE}session${RESET}" ;;
+        message)   echo -e "${GREEN}message${RESET}" ;;
+        block)     echo -e "${YELLOW}block${RESET}" ;;
+        statement) echo -e "${CYAN}statement${RESET}" ;;
+        *)         echo "$level" ;;
+    esac
+}
+
+# Truncate text
+truncate() {
+    local text="$1"
+    local max="${2:-80}"
+    if [[ ${#text} -gt $max ]]; then
+        echo "${text:0:$((max-3))}..."
+    else
+        echo "$text"
+    fi
+}
+
+#
+# Commands
+#
+
+cmd_query() {
+    local query=""
+    local level=""
+    local top_level=""
+    local bottom_level=""
+    local max_results=10
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --level)   level="$2"; shift 2 ;;
+            --top)     top_level="$2"; shift 2 ;;
+            --bottom)  bottom_level="$2"; shift 2 ;;
+            --max)     max_results="$2"; shift 2 ;;
+            -*)        error "Unknown option: $1" ;;
+            *)         query="$1"; shift ;;
+        esac
+    done
+
+    [[ -z "$query" ]] && error "Query text required"
+
+    # Build params
+    local params="{\"query\": \"${query}\", \"max_results\": ${max_results}"
+    [[ -n "$level" ]] && params+=", \"level\": \"${level}\""
+    [[ -n "$top_level" ]] && params+=", \"top_level\": \"${top_level}\""
+    [[ -n "$bottom_level" ]] && params+=", \"bottom_level\": \"${bottom_level}\""
+    params+="}"
+
+    local result
+    result=$(rpc "query" "$params")
+
+    local total=$(echo "$result" | jq -r '.total_matches')
+    local truncated=$(echo "$result" | jq -r '.truncated')
+
+    echo -e "${BOLD}Query:${RESET} ${query}"
+    echo -e "${DIM}Found ${total} matches${RESET}"
+    [[ "$truncated" == "true" ]] && echo -e "${YELLOW}(results truncated)${RESET}"
+    echo
+
+    echo "$result" | jq -r '.results[] | @base64' | while read -r item; do
+        local decoded=$(echo "$item" | base64 -d)
+        local node_id=$(echo "$decoded" | jq -r '.node_id')
+        local level=$(echo "$decoded" | jq -r '.level')
+        local score=$(echo "$decoded" | jq -r '.score')
+        local content=$(echo "$decoded" | jq -r '.content // "(no content)"')
+        local children=$(echo "$decoded" | jq -r '.children_count')
+
+        echo -e "${BOLD}#${node_id}${RESET} $(format_level "$level") ${DIM}(${children} children)${RESET}"
+        format_score "$score"
+        echo -e "  $(truncate "$content" 100)"
+        echo
+    done || true
+}
+
+cmd_drill() {
+    local id=""
+    local filter=""
+    local max_results=100
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --filter) filter="$2"; shift 2 ;;
+            --max)    max_results="$2"; shift 2 ;;
+            -*)       error "Unknown option: $1" ;;
+            *)        id="$1"; shift ;;
+        esac
+    done
+
+    [[ -z "$id" ]] && error "Node ID required"
+
+    local params="{\"id\": ${id}, \"max_results\": ${max_results}"
+    [[ -n "$filter" ]] && params+=", \"filter\": \"${filter}\""
+    params+="}"
+
+    local result
+    result=$(rpc "drill_down" "$params")
+
+    local node_id=$(echo "$result" | jq -r '.node_id')
+    local level=$(echo "$result" | jq -r '.level')
+    local total=$(echo "$result" | jq -r '.total_children')
+    local shown=$(echo "$result" | jq -r '.children_count')
+
+    echo -e "${BOLD}Node #${node_id}${RESET} $(format_level "$level")"
+    echo -e "${DIM}${shown}/${total} children${RESET}"
+    [[ -n "$filter" ]] && echo -e "${DIM}Filter: ${filter}${RESET}"
+    echo
+
+    echo "$result" | jq -r '.children[]? | @base64' | while read -r item; do
+        local decoded=$(echo "$item" | base64 -d)
+        local child_id=$(echo "$decoded" | jq -r '.node_id')
+        local child_level=$(echo "$decoded" | jq -r '.level')
+        local content=$(echo "$decoded" | jq -r '.content // "(no content)"')
+        local children=$(echo "$decoded" | jq -r '.children_count')
+
+        echo -e "  ${BOLD}#${child_id}${RESET} $(format_level "$child_level") ${DIM}(${children} children)${RESET}"
+        echo -e "    $(truncate "$content" 90)"
+        echo
+    done || true
+}
+
+cmd_zoom() {
+    local id="$1"
+    [[ -z "$id" ]] && error "Node ID required"
+
+    local result
+    result=$(rpc "zoom_out" "{\"id\": ${id}}")
+
+    local node_id=$(echo "$result" | jq -r '.node_id')
+    local level=$(echo "$result" | jq -r '.level')
+    local content=$(echo "$result" | jq -r '.content // "(no content)"')
+
+    echo -e "${BOLD}Node #${node_id}${RESET} $(format_level "$level")"
+    echo -e "  $(truncate "$content" 90)"
+    echo
+
+    echo -e "${DIM}Ancestors:${RESET}"
+    echo "$result" | jq -r '.ancestors[]? | @base64' | while read -r item; do
+        local decoded=$(echo "$item" | base64 -d)
+        local anc_id=$(echo "$decoded" | jq -r '.node_id')
+        local anc_level=$(echo "$decoded" | jq -r '.level')
+        local anc_content=$(echo "$decoded" | jq -r '.content // "(no content)"')
+
+        echo -e "  └─ ${BOLD}#${anc_id}${RESET} $(format_level "$anc_level")"
+        [[ "$anc_content" != "(no content)" ]] && echo -e "     $(truncate "$anc_content" 85)"
+    done || true
+}
+
+cmd_sessions() {
+    local session_id="${1:-}"
+
+    if [[ -n "$session_id" ]]; then
+        local result
+        result=$(rpc "get_session" "{\"session_id\": \"${session_id}\"}")
+        echo "$result" | jq .
+    else
+        local result
+        result=$(rpc "list_sessions" "{}")
+
+        local total=$(echo "$result" | jq -r '.total')
+        echo -e "${BOLD}Sessions${RESET} ${DIM}(${total} total)${RESET}"
+        echo
+
+        echo "$result" | jq -r '.sessions[]? | @base64' | while read -r item; do
+            local decoded=$(echo "$item" | base64 -d)
+            local node_id=$(echo "$decoded" | jq -r '.node_id')
+            local sid=$(echo "$decoded" | jq -r '.session_id')
+            local agent=$(echo "$decoded" | jq -r '.agent_id')
+            local count=$(echo "$decoded" | jq -r '.message_count')
+
+            echo -e "${BOLD}#${node_id}${RESET} ${GREEN}${sid}${RESET}"
+            echo -e "  Agent: ${agent}"
+            echo -e "  Messages: ${count}"
+            echo
+        done || true
+    fi
+}
+
+cmd_store() {
+    local type="$1"; shift
+
+    case "$type" in
+        message)
+            [[ $# -lt 3 ]] && error "Usage: store message SESSION AGENT \"content\""
+            local session="$1"
+            local agent="$2"
+            local content="$3"
+            local params="{\"session_id\": \"${session}\", \"agent_id\": \"${agent}\", \"content\": \"${content}\"}"
+            local result
+            result=$(rpc "store" "$params")
+            echo -e "${GREEN}Stored message${RESET}"
+            echo "$result" | jq .
+            ;;
+        block)
+            [[ $# -lt 2 ]] && error "Usage: store block PARENT_ID \"content\""
+            local parent="$1"
+            local content="$2"
+            local params="{\"parent_id\": ${parent}, \"content\": \"${content}\"}"
+            local result
+            result=$(rpc "store_block" "$params")
+            echo -e "${GREEN}Stored block${RESET}"
+            echo "$result" | jq .
+            ;;
+        statement)
+            [[ $# -lt 2 ]] && error "Usage: store statement PARENT_ID \"content\""
+            local parent="$1"
+            local content="$2"
+            local params="{\"parent_id\": ${parent}, \"content\": \"${content}\"}"
+            local result
+            result=$(rpc "store_statement" "$params")
+            echo -e "${GREEN}Stored statement${RESET}"
+            echo "$result" | jq .
+            ;;
+        *)
+            error "Unknown store type: $type (use message|block|statement)"
+            ;;
+    esac
+}
+
+cmd_health() {
+    local response
+    response=$(curl -s "http://${HOST}/health" 2>/dev/null) || error "Failed to connect to ${HOST}"
+
+    local status=$(echo "$response" | jq -r '.status')
+    local nodes=$(echo "$response" | jq -r '.node_count')
+    local uptime=$(echo "$response" | jq -r '.uptime_ms')
+    local requests=$(echo "$response" | jq -r '.request_count')
+
+    # Convert uptime to human readable
+    local uptime_sec=$((uptime / 1000))
+    local uptime_min=$((uptime_sec / 60))
+    local uptime_hr=$((uptime_min / 60))
+
+    if [[ "$status" == "healthy" ]]; then
+        echo -e "${GREEN}●${RESET} ${BOLD}healthy${RESET}"
+    else
+        echo -e "${RED}●${RESET} ${BOLD}${status}${RESET}"
+    fi
+
+    echo -e "  Nodes:    ${nodes}"
+    echo -e "  Requests: ${requests}"
+    if [[ $uptime_hr -gt 0 ]]; then
+        echo -e "  Uptime:   ${uptime_hr}h $((uptime_min % 60))m"
+    elif [[ $uptime_min -gt 0 ]]; then
+        echo -e "  Uptime:   ${uptime_min}m $((uptime_sec % 60))s"
+    else
+        echo -e "  Uptime:   ${uptime_sec}s"
+    fi
+}
+
+#
+# Main
+#
+
+[[ $# -eq 0 ]] && usage
+
+cmd="$1"; shift
+
+case "$cmd" in
+    query)    cmd_query "$@" ;;
+    drill)    cmd_drill "$@" ;;
+    zoom)     cmd_zoom "$@" ;;
+    sessions) cmd_sessions "$@" ;;
+    store)    cmd_store "$@" ;;
+    health)   cmd_health ;;
+    help|-h|--help) usage ;;
+    *)        error "Unknown command: $cmd (try 'mem help')" ;;
+esac

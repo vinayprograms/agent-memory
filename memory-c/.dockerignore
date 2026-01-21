@@ -1,0 +1,6 @@
+build/
+data/
+*.gcov
+*.gcda
+*.gcno
+.git/

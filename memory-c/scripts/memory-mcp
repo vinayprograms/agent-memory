@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+#
+# memory-mcp - MCP server for memory-service
+#
+# Exposes memory-service operations as MCP tools for AI assistants.
+#
+# Environment:
+#   MEMORY_SERVICE_HOST  Service endpoint (default: localhost:8080)
+#
+
+set -u
+
+HOST="${MEMORY_SERVICE_HOST:-localhost:8080}"
+ENDPOINT="http://${HOST}/rpc"
+
+# Log to stderr (not visible to MCP client)
+log() {
+    echo "[memory-mcp] $*" >&2
+}
+
+# Send JSON-RPC response
+respond() {
+    local id="$1"
+    local result="$2"
+    printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$result"
+}
+
+# Send JSON-RPC error
+respond_error() {
+    local id="$1"
+    local code="$2"
+    local message="$3"
+    printf '{"jsonrpc":"2.0","id":%s,"error":{"code":%d,"message":"%s"}}\n' "$id" "$code" "$message"
+}
+
+# Call memory-service JSON-RPC
+call_memory_service() {
+    local method="$1"
+    local params="$2"
+
+    local payload="{\"jsonrpc\":\"2.0\",\"method\":\"${method}\",\"params\":${params},\"id\":1}"
+
+    local response
+    response=$(curl -s -X POST "$ENDPOINT" \
+        -H "Content-Type: application/json" \
+        -d "$payload" 2>/dev/null)
+
+    if [[ $? -ne 0 ]]; then
+        echo '{"error": "Failed to connect to memory-service"}'
+        return 1
+    fi
+
+    # Extract result or error
+    local err=$(echo "$response" | jq -r '.error.message // empty')
+    if [[ -n "$err" ]]; then
+        echo "{\"error\": \"$err\"}"
+        return 1
+    fi
+
+    echo "$response" | jq -c '.result'
+}
+
+# Tool definitions
+get_tools() {
+    cat <<'EOF'
+{
+  "tools": [
+    {
+      "name": "memory_query",
+      "description": "Semantic search across stored memories. Returns relevant content ranked by similarity score.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Search text to find semantically similar content"
+          },
+          "level": {
+            "type": "string",
+            "enum": ["session", "message", "block", "statement"],
+            "description": "Search only this specific level"
+          },
+          "top_level": {
+            "type": "string",
+            "enum": ["session", "message", "block", "statement"],
+            "description": "Highest level to search (default: session)"
+          },
+          "bottom_level": {
+            "type": "string",
+            "enum": ["session", "message", "block", "statement"],
+            "description": "Lowest level to search (default: statement)"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "Maximum results to return (default: 10, max: 100)"
+          }
+        },
+        "required": ["query"]
+      }
+    },
+    {
+      "name": "memory_drill_down",
+      "description": "Get children of a node. Navigate down the hierarchy from session to message to block to statement.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "Node ID to get children of"
+          },
+          "filter": {
+            "type": "string",
+            "description": "Optional text filter for children (case-insensitive)"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "Maximum children to return (default: 100)"
+          }
+        },
+        "required": ["id"]
+      }
+    },
+    {
+      "name": "memory_zoom_out",
+      "description": "Get ancestors of a node. Navigate up the hierarchy to see parent context.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "Node ID to get ancestors of"
+          }
+        },
+        "required": ["id"]
+      }
+    },
+    {
+      "name": "memory_list_sessions",
+      "description": "List all stored sessions with their metadata.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "memory_get_session",
+      "description": "Get details of a specific session.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "description": "Session ID to retrieve"
+          }
+        },
+        "required": ["session_id"]
+      }
+    }
+  ]
+}
+EOF
+}
+
+# Execute a tool
+execute_tool() {
+    local name="$1"
+    local args="$2"
+
+    case "$name" in
+        memory_query)
+            local query=$(echo "$args" | jq -r '.query')
+            local params="{\"query\": \"$query\""
+
+            local level=$(echo "$args" | jq -r '.level // empty')
+            [[ -n "$level" ]] && params+=", \"level\": \"$level\""
+
+            local top=$(echo "$args" | jq -r '.top_level // empty')
+            [[ -n "$top" ]] && params+=", \"top_level\": \"$top\""
+
+            local bottom=$(echo "$args" | jq -r '.bottom_level // empty')
+            [[ -n "$bottom" ]] && params+=", \"bottom_level\": \"$bottom\""
+
+            local max=$(echo "$args" | jq -r '.max_results // empty')
+            [[ -n "$max" ]] && params+=", \"max_results\": $max"
+
+            params+="}"
+            call_memory_service "query" "$params"
+            ;;
+
+        memory_drill_down)
+            local id=$(echo "$args" | jq -r '.id')
+            local params="{\"id\": $id"
+
+            local filter=$(echo "$args" | jq -r '.filter // empty')
+            [[ -n "$filter" ]] && params+=", \"filter\": \"$filter\""
+
+            local max=$(echo "$args" | jq -r '.max_results // empty')
+            [[ -n "$max" ]] && params+=", \"max_results\": $max"
+
+            params+="}"
+            call_memory_service "drill_down" "$params"
+            ;;
+
+        memory_zoom_out)
+            local id=$(echo "$args" | jq -r '.id')
+            call_memory_service "zoom_out" "{\"id\": $id}"
+            ;;
+
+        memory_list_sessions)
+            call_memory_service "list_sessions" "{}"
+            ;;
+
+        memory_get_session)
+            local session_id=$(echo "$args" | jq -r '.session_id')
+            call_memory_service "get_session" "{\"session_id\": \"$session_id\"}"
+            ;;
+
+        *)
+            echo "{\"error\": \"Unknown tool: $name\"}"
+            return 1
+            ;;
+    esac
+}
+
+# Handle a single JSON-RPC request
+handle_request() {
+    local request="$1"
+
+    local id=$(echo "$request" | jq -r '.id // "null"')
+    local method=$(echo "$request" | jq -r '.method')
+    local params=$(echo "$request" | jq -c '.params // {}')
+
+    case "$method" in
+        initialize)
+            respond "$id" '{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"memory-mcp","version":"1.0.0"}}'
+            ;;
+
+        notifications/initialized)
+            # No response needed for notifications
+            ;;
+
+        tools/list)
+            respond "$id" "$(get_tools | jq -c '.')"
+            ;;
+
+        tools/call)
+            local tool_name=$(echo "$params" | jq -r '.name')
+            local tool_args=$(echo "$params" | jq -c '.arguments // {}')
+
+            local result
+            result=$(execute_tool "$tool_name" "$tool_args")
+
+            local error_check=$(echo "$result" | jq -r '.error // empty')
+            if [[ -n "$error_check" ]]; then
+                respond "$id" "{\"content\": [{\"type\": \"text\", \"text\": \"Error: $error_check\"}], \"isError\": true}"
+            else
+                local text=$(echo "$result" | jq -c '.')
+                respond "$id" "{\"content\": [{\"type\": \"text\", \"text\": $(echo "$text" | jq -Rs '.')}]}"
+            fi
+            ;;
+
+        *)
+            respond_error "$id" -32601 "Method not found: $method"
+            ;;
+    esac
+}
+
+# Main loop - read JSON-RPC requests from stdin
+main() {
+    log "Started (endpoint: $ENDPOINT)"
+
+    while IFS= read -r line; do
+        # Skip empty lines
+        [[ -z "$line" ]] && continue
+
+        # Log incoming request
+        log "Request: $line"
+
+        # Handle the request
+        handle_request "$line"
+
+    done
+
+    log "Shutdown"
+}
+
+main

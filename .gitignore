@@ -1,0 +1,38 @@
+
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.dylib
+
+# Data files
+data/
+
+# Model files (large, download separately)
+models/
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Temporary files
+*.tmp
+*.log
+
+# Other files
+*.gcov
+*.gcda
+*.gcno
+
+# Internal directories
+notes/
+build/
+.cache/
+.tmp/
